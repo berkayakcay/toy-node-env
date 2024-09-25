@@ -1,64 +1,125 @@
 // src/parser.ts
 
-import "reflect-metadata";
-import { getEnvironmentVariableName } from "./decorators/EnvironmentVariable";
-import { ClassConstructor } from "class-transformer";
-import { set } from "lodash";
-import { getFromContainer, MetadataStorage } from "class-validator";
+import { z, ZodTypeAny } from "zod";
 
-function getClassProperties(target: Function): string[] {
-  const metadataStorage = getFromContainer(MetadataStorage) as any;
-  const validations = metadataStorage.getTargetValidationMetadatas(
-    target,
-    "",
-    false,
-    false
-  );
-  const properties = validations.map((meta: any) => meta.propertyName);
-  return [...new Set<string>(properties)]; // Remove duplicates
+function getEnvVarName(schema: ZodTypeAny): string | undefined {
+  const env = (schema._def as any).env;
+  if (env) {
+    return env;
+  } else if (
+    schema instanceof z.ZodOptional ||
+    schema instanceof z.ZodNullable
+  ) {
+    return getEnvVarName(schema.unwrap());
+  } else if (schema instanceof z.ZodDefault) {
+    return getEnvVarName(schema.removeDefault());
+  } else if (schema instanceof z.ZodEffects) {
+    return getEnvVarName(schema.innerType());
+  } else {
+    return undefined;
+  }
 }
 
-export function parseEnv<T>(
-  cls: ClassConstructor<T>,
-  prefix: string = ""
-): any {
-  const plainObject: any = {};
+function traverseSchema(
+  schema: ZodTypeAny,
+  path: string[] = []
+): [string[], ZodTypeAny][] {
+  if (schema instanceof z.ZodObject) {
+    const shape = schema.shape;
+    let entries: [string[], ZodTypeAny][] = [];
+    for (const key in shape) {
+      const childSchema = shape[key];
+      const childEntries = traverseSchema(childSchema, [...path, key]);
+      entries = entries.concat(childEntries);
+    }
+    return entries;
+  } else {
+    const envVarName = getEnvVarName(schema);
+    if (envVarName) {
+      return [[path, schema]];
+    } else {
+      return [];
+    }
+  }
+}
 
-  function parseClass(target: any, path: string[] = [], plainObj: any) {
-    const properties = getClassProperties(target.constructor);
+export function loadConfig<T>(schema: z.ZodType<T>): T {
+  const envMappings = traverseSchema(schema);
 
-    for (const property of properties) {
-      const propertyType = Reflect.getMetadata("design:type", target, property);
-      const envVarName = getEnvironmentVariableName(target, property);
+  const configObject: any = {};
 
-      let envValue;
-      if (envVarName) {
-        envValue = process.env[envVarName];
-      } else {
-        // Apply custom mapping rules
-        const envKey = [prefix, ...path, property]
-          .map((segment) => segment.replace(/([A-Z])/g, "_$1").toUpperCase())
-          .join("__");
-        envValue = process.env[envKey];
+  for (const [path, schema] of envMappings) {
+    const envVarName = getEnvVarName(schema);
+    if (!envVarName) continue;
+
+    const envValue = process.env[envVarName];
+
+    let parsedValue: any;
+
+    if (envValue === undefined) {
+      // Check for default value
+      if (schema.isOptional()) {
+        continue; // Skip if optional
       }
 
-      if (
-        propertyType &&
-        typeof propertyType === "function" &&
-        ![String, Number, Boolean].includes(propertyType)
-      ) {
-        // Nested object
-        const nestedPlainObject = {};
-        parseClass(new propertyType(), [...path, property], nestedPlainObject);
-        plainObj[property] = nestedPlainObject;
-      } else if (envValue !== undefined) {
-        plainObj[property] = envValue;
+      try {
+        parsedValue = (schema as any)._def.defaultValue?.();
+        if (parsedValue === undefined) {
+          throw new Error(
+            `Environment variable ${envVarName} is required but not set.`
+          );
+        }
+      } catch {
+        throw new Error(
+          `Environment variable ${envVarName} is required but not set.`
+        );
+      }
+    } else {
+      // Parse the value according to the schema type
+      if (schema instanceof z.ZodNumber) {
+        parsedValue = Number(envValue);
+      } else if (schema instanceof z.ZodBoolean) {
+        parsedValue = envValue === "true";
+      } else {
+        parsedValue = envValue;
+      }
+    }
+
+    // Set the parsed value in the config object
+    let current = configObject;
+    for (let i = 0; i < path.length; i++) {
+      const key = path[i];
+      if (i === path.length - 1) {
+        current[key] = parsedValue;
+      } else {
+        current[key] = current[key] || {};
+        current = current[key];
       }
     }
   }
 
-  const instance = new cls();
-  parseClass(instance, [], plainObject);
+  // Validate and parse the configuration
+  try {
+    const parsedConfig = schema.parse(configObject);
+    return parsedConfig;
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      // Format the validation errors
+      const errorMessages = error.errors
+        .map((issue) => {
+          const path = issue.path.join(".");
+          return `- ${path}: ${issue.message}`;
+        })
+        .join("\n");
 
-  return plainObject;
+      // Throw a new error with the formatted messages
+      console.log(error.errors);
+      throw new Error(
+        `Configuration validation failed: ${errorMessages}\n${error.message}`
+      );
+    } else {
+      // Re-throw other unexpected errors
+      throw error;
+    }
+  }
 }

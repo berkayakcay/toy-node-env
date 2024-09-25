@@ -5,9 +5,9 @@
     "outDir": "./dist",
     "rootDir": "./src",
     "strict": true,
-    "experimentalDecorators": true,
-    "emitDecoratorMetadata": true,
-    "esModuleInterop": true
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true
   },
   "include": ["src/**/*"]
 }
